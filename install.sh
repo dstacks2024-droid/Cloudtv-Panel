@@ -1,53 +1,44 @@
 #!/bin/bash
-set -e
 
-MYSQL_ROOT_PASSWORD="CloudTVpass123"
-DEPLOY_ZIP_URL="https://www.dropbox.com/scl/fo/xmmyvtptze8k5y1teile5/AMTABiEqtAwJ1yntfBona1s?rlkey=vxdn6duquzh27rezpzgoqdhn1&dl=1"
+echo "🔧 Updating system and installing dependencies..."
+sudo apt update
+sudo apt install -y curl gnupg lsb-release ca-certificates apt-transport-https software-properties-common
 
-echo "🔧 Starting CloudTV installation..."
+echo "📦 Installing Node.js..."
+curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+sudo apt install -y nodejs
 
-apt update && apt upgrade -y
-apt install -y curl wget git unzip nginx mysql-server ffmpeg build-essential
+echo "📦 Installing MySQL Server..."
+sudo apt install -y mysql-server
 
-curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-apt install -y nodejs
-npm install -g pm2
+echo "🔐 Setting MySQL root password..."
+sudo mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'CloudTVpass123'; FLUSH PRIVILEGES;"
 
-systemctl enable mysql
-systemctl start mysql
-mysql -u root <<EOF
-ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASSWORD}';
-FLUSH PRIVILEGES;
-EOF
-
-mkdir -p /opt/cloudtv
-cd /opt/cloudtv
-wget -O CloudTV_Deploy.zip "$DEPLOY_ZIP_URL"
-unzip -o CloudTV_Deploy.zip -d /opt/cloudtv
-
-cd /opt/cloudtv/backend
-npm install
-pm2 start index.js --name cloudtv-backend
-pm2 save
+echo "📦 Installing PM2..."
+sudo npm install -g pm2
 pm2 startup systemd -u $USER --hp $HOME
 
-FRONTEND_DIR="/opt/cloudtv/frontend"
-if [ -d "$FRONTEND_DIR" ]; then
-    rm -rf /var/www/html/*
-    cp -r "$FRONTEND_DIR"/* /var/www/html/
-else
-    echo "❌ ERROR: Frontend directory not found!"
-    exit 1
-fi
+echo "📦 Installing Nginx and FFmpeg..."
+sudo apt install -y nginx ffmpeg
 
-cat >/etc/nginx/sites-available/default <<EOL
+echo "🌐 Cloning CloudTV Panel from GitHub..."
+git clone https://github.com/dstacks2024-droid/Cloudtv-Panel.git /opt/cloudtv
+
+echo "🚀 Setting up Backend..."
+cd /opt/cloudtv/backend || exit 1
+npm install
+pm2 start index.js --name cloudtv
+pm2 save
+
+echo "🌐 Setting up Frontend..."
+sudo cp -r /opt/cloudtv/frontend/* /var/www/html/
+
+echo "⚙️ Configuring Nginx..."
+sudo tee /etc/nginx/sites-available/cloudtv <<EOF
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    root /var/www/html;
-    index index.html;
+    listen 80;
     server_name _;
-
+    
     location /api/ {
         proxy_pass http://localhost:3000/;
         proxy_http_version 1.1;
@@ -58,16 +49,14 @@ server {
     }
 
     location / {
-        try_files \$uri \$uri/ /index.html;
+        root /var/www/html;
+        index index.html index.htm;
     }
 }
-EOL
+EOF
 
-systemctl restart nginx
+sudo ln -s /etc/nginx/sites-available/cloudtv /etc/nginx/sites-enabled/
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo systemctl restart nginx
 
-echo ""
-echo "✅ CloudTV Installation Complete!"
-echo "🌐 Visit your panel at: http://<YOUR_SERVER_IP>"
-echo "🛠 Backend running with PM2 as: cloudtv-backend"
-echo "🔐 MySQL Root Password: ${MYSQL_ROOT_PASSWORD}"
-echo ""
+echo "✅ CloudTV Panel installation complete!"
