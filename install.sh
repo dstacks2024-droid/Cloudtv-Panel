@@ -1,51 +1,57 @@
 #!/bin/bash
 
-echo "🔧 Updating system and installing dependencies..."
-sudo apt update
-sudo apt install -y curl gnupg lsb-release ca-certificates apt-transport-https software-properties-common
+# Cloud TV Install Script
 
-echo "📦 Installing Node.js..."
-curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-sudo apt install -y nodejs
+echo "📦 Installing dependencies..."
 
-echo "📦 Installing MySQL Server..."
-sudo apt install -y mysql-server
+# Update packages
+sudo apt update && sudo apt upgrade -y
 
-echo "🔐 Setting MySQL root password..."
-sudo mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'CloudTVpass123'; FLUSH PRIVILEGES;"
+# Install Node.js (LTS), MySQL, Nginx, FFmpeg, Git, unzip
+sudo apt install -y nodejs npm mysql-server nginx ffmpeg git unzip curl
 
-echo "📦 Installing PM2..."
-sudo npm install -g pm2
-pm2 startup systemd -u $USER --hp $HOME
+# Setup MySQL root password
+echo "🔐 Configuring MySQL..."
+sudo mysql <<EOF
+ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'CloudTVpass123';
+FLUSH PRIVILEGES;
+EOF
 
-echo "📦 Installing Nginx and FFmpeg..."
-sudo apt install -y nginx ffmpeg
-
-echo "🌐 Cloning CloudTV Panel from GitHub..."
-git clone https://github.com/dstacks2024-droid/Cloudtv-Panel.git /opt/cloudtv
-
-echo "🚀 Setting up Backend..."
-cd /opt/cloudtv/backend || exit 1
+# Clone GitHub repo
+echo "📁 Cloning CloudTV repo..."
+mkdir -p /opt/cloudtv
+cd /opt/cloudtv
+git clone https://github.com/dstacks2024-droid/Cloudtv-Panel.git .
 npm install
-pm2 start index.js --name cloudtv
+
+# Start backend with PM2
+echo "🚀 Starting backend with PM2..."
+sudo npm install -g pm2
+pm2 start index.js --name cloudtv-backend
 pm2 save
+pm2 startup systemd
+sudo env PATH=$PATH:/usr/bin pm2 startup systemd -u $USER --hp $HOME
 
-echo "🌐 Setting up Frontend..."
-sudo cp -r /opt/cloudtv/frontend/* /var/www/html/
+# Deploy frontend
+echo "🌐 Deploying frontend..."
+sudo rm -rf /var/www/html/*
+sudo cp index.html /var/www/html/
+sudo systemctl restart nginx
 
-echo "⚙️ Configuring Nginx..."
-sudo tee /etc/nginx/sites-available/cloudtv <<EOF
+# Configure Nginx reverse proxy
+echo "🔧 Setting up Nginx reverse proxy..."
+
+sudo bash -c 'cat > /etc/nginx/sites-available/cloudtv <<EOF
 server {
     listen 80;
     server_name _;
-    
+
     location /api/ {
-        proxy_pass http://localhost:3000/;
+        proxy_pass http://localhost:8000/;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection 'upgrade';
+        proxy_set_header Connection "upgrade";
         proxy_set_header Host \$host;
-        proxy_cache_bypass \$http_upgrade;
     }
 
     location / {
@@ -53,10 +59,10 @@ server {
         index index.html index.htm;
     }
 }
-EOF
+EOF'
 
-sudo ln -s /etc/nginx/sites-available/cloudtv /etc/nginx/sites-enabled/
-sudo rm -f /etc/nginx/sites-enabled/default
-sudo systemctl restart nginx
+sudo ln -sf /etc/nginx/sites-available/cloudtv /etc/nginx/sites-enabled/cloudtv
+sudo nginx -t && sudo systemctl reload nginx
 
-echo "✅ CloudTV Panel installation complete!"
+echo "✅ Cloud TV panel installed and running."
+echo "Visit your server IP to see the frontend."
