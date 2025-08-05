@@ -1,49 +1,61 @@
 #!/bin/bash
 
-# Set MySQL root password
-MYSQL_ROOT_PASSWORD="CloudTVpass123"
+# --- SETUP VARIABLES ---
+MYSQL_ROOT_PASS="CloudTVpass123"
+REPO_URL="https://github.com/dstacks2024-droid/Cloudtv-Panel.git"
+INSTALL_DIR="/opt/cloudtv"
 
-echo "Updating system..."
+echo "🔧 Updating system..."
 apt update && apt upgrade -y
 
-echo "Installing dependencies..."
-apt install -y curl wget gnupg software-properties-common ffmpeg nginx
+echo "📦 Installing dependencies..."
+apt install -y curl wget gnupg ffmpeg nginx mysql-server build-essential git
 
-echo "Installing Node.js (LTS)..."
+# --- NODEJS INSTALL ---
+echo "📦 Installing Node.js LTS..."
 curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
 apt install -y nodejs
 
-echo "Installing PM2..."
+# --- PM2 INSTALL ---
 npm install -g pm2
 
-echo "Installing MySQL..."
-DEBIAN_FRONTEND=noninteractive apt install -y mysql-server
-mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASSWORD}'; FLUSH PRIVILEGES;"
+# --- MySQL CONFIG ---
+echo "🛠️ Configuring MySQL..."
+systemctl start mysql
+mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASS}'; FLUSH PRIVILEGES;" || true
 
-echo "Cloning CloudTV Panel..."
-mkdir -p /opt/cloudtv
-cd /opt/cloudtv
-git clone https://github.com/dstacks2024-droid/Cloudtv-Panel.git .
-cd backend
+# --- CLONE PROJECT ---
+echo "📁 Cloning Cloud TV Panel from GitHub..."
+rm -rf "$INSTALL_DIR"
+git clone "$REPO_URL" "$INSTALL_DIR"
+
+# --- INSTALL BACKEND ---
+echo "⚙️ Setting up backend..."
+cd "$INSTALL_DIR/backend" || exit
 npm install
-
-echo "Starting backend with PM2..."
 pm2 start index.js --name cloudtv-backend
 pm2 save
 pm2 startup systemd -u $USER --hp $HOME
 
-echo "Deploying frontend..."
-mkdir -p /var/www/html
-cp -r ../frontend/* /var/www/html/
+# --- INSTALL FRONTEND ---
+echo "⚙️ Setting up frontend..."
+cd "$INSTALL_DIR/frontend" || exit
+npm install
+npm run build
 
-echo "Configuring Nginx..."
-cat >/etc/nginx/sites-available/cloudtv <<EOL
+# --- NGINX CONFIG ---
+echo "🌐 Configuring Nginx to serve frontend..."
+
+cat > /etc/nginx/sites-available/cloudtv <<EOF
 server {
     listen 80;
     server_name _;
 
+    root $INSTALL_DIR/frontend/dist;
+    index index.html;
+
     location /api/ {
-        proxy_pass http://localhost:8000/;
+        proxy_pass http://localhost:3000/;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection 'upgrade';
@@ -52,19 +64,18 @@ server {
     }
 
     location / {
-        root /var/www/html;
-        index index.html;
-        try_files \$uri \$uri/ =404;
+        try_files \$uri /index.html;
     }
 }
-EOL
+EOF
 
 ln -sf /etc/nginx/sites-available/cloudtv /etc/nginx/sites-enabled/cloudtv
 rm -f /etc/nginx/sites-enabled/default
-
-echo "Restarting Nginx..."
 systemctl restart nginx
 systemctl enable nginx
 
-echo "Cloud TV panel installed and running."
-echo "Visit your server IP to see the frontend."
+# --- DONE ---
+echo ""
+echo "✅ Cloud TV Panel is now installed and running!"
+echo "🌐 Visit http://<your-server-ip> to access the panel."
+echo "⚙️ MySQL root password: ${MYSQL_ROOT_PASS}"
