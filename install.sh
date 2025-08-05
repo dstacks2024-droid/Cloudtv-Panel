@@ -1,94 +1,72 @@
 #!/bin/bash
 
-# === CONFIGURE THESE ===
-MYSQL_ROOT_PASSWORD="CloudTVpass123"
-DOMAIN_NAME="" # Leave blank to skip SSL (e.g., yourdomain.com)
-FRONTEND_DIR="frontend"
-BACKEND_DIR="backend"
+# Variables
+REPO_URL="https://github.com/dstacks2024-droid/Cloudtv-Panel.git"
+INSTALL_DIR="/var/www/cloudtv"
+MYSQL_PASSWORD="CloudTVpass123"
+DOMAIN="yourdomain.com"
 
-# === System Update ===
+echo "Updating system..."
 apt update && apt upgrade -y
 
-# === Install Required Packages ===
-apt install -y curl gnupg2 software-properties-common build-essential nginx mysql-server ffmpeg
+echo "Installing dependencies..."
+apt install -y curl gnupg build-essential nginx mysql-server ffmpeg git
 
-# === Install Node.js 18 ===
-curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+echo "Installing Node.js LTS..."
+curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
 apt install -y nodejs
 
-# === Install PM2 ===
+echo "Installing PM2..."
 npm install -g pm2
 
-# === Secure MySQL and Create DB ===
-echo "Securing MySQL..."
-mysql -u root <<EOF
-ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASSWORD}';
-FLUSH PRIVILEGES;
-CREATE DATABASE IF NOT EXISTS cloudtv CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-EOF
+echo "Cloning GitHub repo..."
+git clone $REPO_URL $INSTALL_DIR
+cd $INSTALL_DIR
 
-# === Set Up Backend ===
-echo "Setting up backend..."
-cd $BACKEND_DIR
+echo "Installing backend dependencies..."
+cd backend
 npm install
-cp .env.example .env 2>/dev/null
-sed -i "s/DB_PASSWORD=.*/DB_PASSWORD=${MYSQL_ROOT_PASSWORD}/" .env
-pm2 start index.js --name cloudtv-api
-pm2 save
-cd ..
 
-# === Set Up Frontend ===
-echo "Setting up frontend build..."
-cd $FRONTEND_DIR
+echo "Setting up database..."
+mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$MYSQL_PASSWORD'; FLUSH PRIVILEGES;"
+mysql -u root -p$MYSQL_PASSWORD < database/init.sql
+
+echo "Starting backend with PM2..."
+pm2 start server.js --name cloudtv-backend
+pm2 save
+pm2 startup systemd
+
+echo "Building frontend..."
+cd ../frontend
 npm install
 npm run build
-cd ..
 
-# === Configure NGINX ===
-echo "Configuring NGINX..."
-cat > /etc/nginx/sites-available/cloudtv <<EOL
+echo "Setting up NGINX config..."
+cat > /etc/nginx/sites-available/cloudtv <<EOF
 server {
     listen 80;
-    server_name ${DOMAIN_NAME};
+    server_name $DOMAIN;
 
-    root /var/www/cloudtv;
+    root $INSTALL_DIR/frontend/build;
     index index.html;
 
-    location / {
-        try_files \$uri /index.html;
-    }
-
     location /api/ {
-        proxy_pass http://localhost:8080/api/;
+        proxy_pass http://localhost:8080/;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection 'upgrade';
         proxy_set_header Host \$host;
         proxy_cache_bypass \$http_upgrade;
     }
-}
-EOL
 
-# === Deploy Frontend ===
-rm -rf /var/www/cloudtv
-cp -r $FRONTEND_DIR/build /var/www/cloudtv
+    location / {
+        try_files \$uri /index.html;
+    }
+}
+EOF
 
 ln -s /etc/nginx/sites-available/cloudtv /etc/nginx/sites-enabled/
 nginx -t && systemctl restart nginx
 
-# === Install SSL if domain is set ===
-if [ ! -z "$DOMAIN_NAME" ]; then
-    echo "Installing Certbot SSL..."
-    apt install -y certbot python3-certbot-nginx
-    certbot --nginx -d $DOMAIN_NAME --non-interactive --agree-tos -m admin@$DOMAIN_NAME
-fi
-
-# === Enable Services on Boot ===
-systemctl enable mysql
-systemctl enable nginx
-pm2 startup systemd -u $(whoami) --hp $HOME
-pm2 save
-
-echo "✅ CloudTV installation complete."
-echo "Frontend: http://${DOMAIN_NAME:-your_server_ip}"
-echo "Backend API: http://localhost:8080/api/"
+echo "✅ CloudTV Panel is now installed."
+echo "Visit: http://$DOMAIN"
