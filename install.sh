@@ -2,26 +2,27 @@
 
 set -e
 
-echo "Updating system packages..."
-sudo apt update && sudo apt upgrade -y
+# Update and install packages
+echo "Updating system and installing dependencies..."
+apt update && apt upgrade -y
+apt install -y apache2 mysql-server php php-cli php-common php-mysql php-curl php-mbstring php-xml php-zip php-gd unzip wget
 
-echo "Installing Apache2, PHP, MySQL..."
-sudo apt install -y apache2 mysql-server php php-cli php-common php-mysql php-curl php-mbstring php-xml php-zip php-gd unzip wget
+# Start and enable Apache and MySQL
+systemctl start apache2
+systemctl enable apache2
+systemctl start mysql
+systemctl enable mysql
 
-echo "Starting and enabling Apache2 and MySQL..."
-sudo systemctl start apache2
-sudo systemctl enable apache2
-sudo systemctl start mysql
-sudo systemctl enable mysql
-
-echo "Securing MySQL and setting root password..."
-sudo mysql <<EOF
+# Set MySQL root password and secure installation
+echo "Setting MySQL root password and permissions..."
+mysql --user=root <<_EOF_
 ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'CloudTVpass123';
 FLUSH PRIVILEGES;
-EOF
+_EOF_
 
-echo "Creating CloudTV database and importing schema..."
-mysql -uroot -pCloudTVpass123 <<EOF
+# Create database and tables
+echo "Creating database and tables..."
+mysql -uroot -pCloudTVpass123 <<_EOF_
 CREATE DATABASE IF NOT EXISTS cloudtv;
 USE cloudtv;
 
@@ -32,7 +33,7 @@ CREATE TABLE IF NOT EXISTS admins (
 );
 
 INSERT IGNORE INTO admins (username, password) VALUES
-('admin', '\$2y\$10\$v4RKL9D.4tTTMbyi8cCLkewGeQ/f9A9R6EWrLO7OhKzSlnHi5zRVO'); -- admin123
+('admin', '\$2y\$10\$v4RKL9D.4tTTMbyi8cCLkewGeQ/f9A9R6EWrLO7OhKzSlnHi5zRVO'); -- password: admin123
 
 CREATE TABLE IF NOT EXISTS users (
   id INT AUTO_INCREMENT PRIMARY KEY,
@@ -69,17 +70,16 @@ CREATE TABLE IF NOT EXISTS series (
   url TEXT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-EOF
+_EOF_
 
-echo "Deploying Cloud TV panel files..."
-
+# Define app directory
 APPDIR="/var/www/html/cloudtv"
-sudo mkdir -p $APPDIR
+mkdir -p $APPDIR
 
-echo "Creating PHP files..."
+echo "Creating PHP source files..."
 
-# index.html (login page)
-sudo tee $APPDIR/index.html > /dev/null <<'EOF'
+# index.html
+cat > $APPDIR/index.html <<'EOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -150,7 +150,7 @@ sudo tee $APPDIR/index.html > /dev/null <<'EOF'
 EOF
 
 # login.php
-sudo tee $APPDIR/login.php > /dev/null <<'EOF'
+cat > $APPDIR/login.php <<'EOF'
 <?php
 session_start();
 
@@ -188,7 +188,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 EOF
 
 # dashboard.php
-sudo tee $APPDIR/dashboard.php > /dev/null <<'EOF'
+cat > $APPDIR/dashboard.php <<'EOF'
 <?php
 session_start();
 if (!isset($_SESSION['admin_logged_in'])) {
@@ -253,7 +253,7 @@ if (!isset($_SESSION['admin_logged_in'])) {
 EOF
 
 # logout.php
-sudo tee $APPDIR/logout.php > /dev/null <<'EOF'
+cat > $APPDIR/logout.php <<'EOF'
 <?php
 session_start();
 session_destroy();
@@ -263,7 +263,7 @@ exit();
 EOF
 
 # users.php
-sudo tee $APPDIR/users.php > /dev/null <<'EOF'
+cat > $APPDIR/users.php <<'EOF'
 <?php
 session_start();
 if (!isset($_SESSION['admin_logged_in'])) {
@@ -355,7 +355,7 @@ $users = $pdo->query("SELECT * FROM users ORDER BY created_at DESC")->fetchAll(P
 EOF
 
 # streams.php
-sudo tee $APPDIR/streams.php > /dev/null <<'EOF'
+cat > $APPDIR/streams.php <<'EOF'
 <?php
 session_start();
 if (!isset($_SESSION['admin_logged_in'])) {
@@ -427,7 +427,7 @@ $streams = $pdo->query("SELECT * FROM streams ORDER BY id DESC")->fetchAll(PDO::
 EOF
 
 # vod.php
-sudo tee $APPDIR/vod.php > /dev/null <<'EOF'
+cat > $APPDIR/vod.php <<'EOF'
 <?php
 session_start();
 if (!isset($_SESSION['admin_logged_in'])) {
@@ -501,7 +501,7 @@ $vodList = $pdo->query("SELECT * FROM vod ORDER BY id DESC")->fetchAll(PDO::FETC
 EOF
 
 # series.php
-sudo tee $APPDIR/series.php > /dev/null <<'EOF'
+cat > $APPDIR/series.php <<'EOF'
 <?php
 session_start();
 if (!isset($_SESSION['admin_logged_in'])) {
@@ -571,18 +571,23 @@ $seriesList = $pdo->query("SELECT * FROM series ORDER BY id DESC")->fetchAll(PDO
 </html>
 EOF
 
-echo "Setting permissions..."
-sudo chown -R www-data:www-data $APPDIR
-sudo chmod -R 755 $APPDIR
+echo "Setting folder ownership and permissions..."
+chown -R www-data:www-data $APPDIR
+chmod -R 755 $APPDIR
 
-echo "Enabling Apache rewrite module and allowing .htaccess overrides..."
-sudo a2enmod rewrite
-sudo sed -i '/<Directory \/var\/www\/>/,/<\/Directory>/ s/AllowOverride None/AllowOverride All/' /etc/apache2/apache2.conf
+echo "Configuring Apache to allow .htaccess overrides..."
 
-echo "Restarting Apache..."
-sudo systemctl restart apache2
+# Enable rewrite module
+a2enmod rewrite
+
+# Allow .htaccess override in Apache config
+sed -i '/<Directory \/var\/www\/>/,/<\/Directory>/ s/AllowOverride None/AllowOverride All/' /etc/apache2/apache2.conf
+
+echo "Restarting Apache service..."
+systemctl restart apache2
 
 echo "Installation complete!"
-echo "Open your browser and visit: http://localhost/cloudtv"
+echo "Open your browser and visit: http://your-server-ip/cloudtv"
 echo "Login with username: admin and password: admin123"
 
+exit 0
