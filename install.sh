@@ -1,566 +1,588 @@
 #!/bin/bash
 
-# --- Configuration variables ---
-DB_ROOT_PASS="RootPass123!"   # Change this before running for security
-DB_NAME="iptv_panel"
-DB_USER="iptvuser"
-DB_PASS="iptvpass123"
-ADMIN_USER="admin"
-ADMIN_EMAIL="admin@example.com"
-ADMIN_PASS="admin123"
-WEB_ROOT="/var/www/iptv-panel"
+set -e
 
-# --- Update system and install packages ---
-echo "[1/10] Updating system and installing required packages..."
-apt update && apt upgrade -y
-apt install -y apache2 mysql-server php php-mysql php-xml php-mbstring php-curl php-gd unzip curl libapache2-mod-php
+echo "Updating system packages..."
+sudo apt update && sudo apt upgrade -y
 
-# Enable mod_rewrite for Apache
-echo "[2/10] Enabling Apache mod_rewrite..."
-a2enmod rewrite
+echo "Installing Apache2, PHP, MySQL..."
+sudo apt install -y apache2 mysql-server php php-cli php-common php-mysql php-curl php-mbstring php-xml php-zip php-gd unzip wget
 
-# Restart Apache to apply mods
-systemctl restart apache2
+echo "Starting and enabling Apache2 and MySQL..."
+sudo systemctl start apache2
+sudo systemctl enable apache2
+sudo systemctl start mysql
+sudo systemctl enable mysql
 
-# --- Secure MySQL (noninteractive) ---
-echo "[3/10] Securing MySQL installation and setting root password..."
-# Set root password and remove anonymous users, disallow remote root login, remove test db, reload privileges
-mysql <<EOF
-ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '$DB_ROOT_PASS';
-DELETE FROM mysql.user WHERE User='';
-DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost');
-DROP DATABASE IF EXISTS test;
-DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+echo "Securing MySQL and setting root password..."
+sudo mysql <<EOF
+ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'CloudTVpass123';
 FLUSH PRIVILEGES;
 EOF
 
-# --- Create IPTV panel database and user ---
-echo "[4/10] Creating MySQL database and user for IPTV panel..."
-mysql -uroot -p"$DB_ROOT_PASS" <<EOF
-CREATE DATABASE IF NOT EXISTS $DB_NAME CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
-GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'localhost';
-FLUSH PRIVILEGES;
-EOF
+echo "Creating CloudTV database and importing schema..."
+mysql -uroot -pCloudTVpass123 <<EOF
+CREATE DATABASE IF NOT EXISTS cloudtv;
+USE cloudtv;
 
-# --- Create database tables ---
-echo "[5/10] Creating database tables..."
-mysql -u"$DB_USER" -p"$DB_PASS" $DB_NAME <<EOF
-CREATE TABLE IF NOT EXISTS users (
+CREATE TABLE IF NOT EXISTS admins (
   id INT AUTO_INCREMENT PRIMARY KEY,
   username VARCHAR(50) UNIQUE NOT NULL,
-  email VARCHAR(100) NOT NULL,
-  password VARCHAR(255) NOT NULL,
-  role ENUM('admin','user') DEFAULT 'user',
+  password VARCHAR(255) NOT NULL
+);
+
+INSERT IGNORE INTO admins (username, password) VALUES
+('admin', '\$2y\$10\$v4RKL9D.4tTTMbyi8cCLkewGeQ/f9A9R6EWrLO7OhKzSlnHi5zRVO'); -- admin123
+
+CREATE TABLE IF NOT EXISTS users (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(100),
+  username VARCHAR(50) UNIQUE,
+  password VARCHAR(255),
+  plan VARCHAR(50),
+  max_connections INT DEFAULT 1,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS streams (
   id INT AUTO_INCREMENT PRIMARY KEY,
-  name VARCHAR(255) NOT NULL,
-  stream_url TEXT NOT NULL,
-  created_by INT NOT NULL,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE
+  name VARCHAR(100),
+  url TEXT,
+  category VARCHAR(50),
+  status ENUM('online','offline') DEFAULT 'online',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS epg (
+CREATE TABLE IF NOT EXISTS vod (
   id INT AUTO_INCREMENT PRIMARY KEY,
-  channel_name VARCHAR(255),
-  start_time DATETIME,
-  end_time DATETIME,
   title VARCHAR(255),
-  description TEXT
+  description TEXT,
+  url TEXT,
+  cover_image TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS series (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  series VARCHAR(255),
+  episode VARCHAR(255),
+  url TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 EOF
 
-# --- Create initial admin user ---
-echo "[6/10] Creating initial admin user..."
-HASHED_PASS=$(php -r "echo password_hash('$ADMIN_PASS', PASSWORD_DEFAULT);")
-mysql -u"$DB_USER" -p"$DB_PASS" $DB_NAME <<EOF
-INSERT INTO users (username, email, password, role) VALUES
-('$ADMIN_USER', '$ADMIN_EMAIL', '$HASHED_PASS', 'admin')
-ON DUPLICATE KEY UPDATE username=username;
-EOF
+echo "Deploying Cloud TV panel files..."
 
-# --- Setup web root ---
-echo "[7/10] Setting up web root and panel files..."
+APPDIR="/var/www/html/cloudtv"
+sudo mkdir -p $APPDIR
 
-mkdir -p $WEB_ROOT/public
-chown -R www-data:www-data $WEB_ROOT
-chmod -R 755 $WEB_ROOT
+echo "Creating PHP files..."
 
-# --- Write .htaccess to enable URL rewriting ---
-cat > $WEB_ROOT/public/.htaccess <<'EOF'
-RewriteEngine On
-RewriteCond %{REQUEST_FILENAME} !-f
-RewriteCond %{REQUEST_FILENAME} !-d
-RewriteRule ^(.*)$ index.php?/$1 [L,QSA]
-EOF
-
-# --- Write config file ---
-mkdir -p $WEB_ROOT/config
-cat > $WEB_ROOT/config/config.php <<EOF
-<?php
-return [
-    'db_host' => 'localhost',
-    'db_name' => '$DB_NAME',
-    'db_user' => '$DB_USER',
-    'db_pass' => '$DB_PASS',
-];
-EOF
-
-# --- Write database connection class ---
-mkdir -p $WEB_ROOT/src
-cat > $WEB_ROOT/src/db.php <<'EOF'
-<?php
-class Database {
-    private static \$instance = null;
-    private \$conn;
-
-    private function __construct() {
-        \$config = include __DIR__ . '/../config/config.php';
-        \$this->conn = new mysqli(
-            \$config['db_host'],
-            \$config['db_user'],
-            \$config['db_pass'],
-            \$config['db_name']
-        );
-        if (\$this->conn->connect_error) {
-            die("Database connection failed: " . \$this->conn->connect_error);
-        }
-        \$this->conn->set_charset("utf8mb4");
-    }
-
-    public static function getInstance() {
-        if (self::\$instance === null) {
-            self::\$instance = new Database();
-        }
-        return self::\$instance;
-    }
-
-    public function getConnection() {
-        return \$this->conn;
-    }
-}
-EOF
-
-# --- Write auth functions ---
-cat > $WEB_ROOT/src/auth.php <<'EOF'
-<?php
-session_start();
-
-require_once 'db.php';
-
-function isLoggedIn() {
-    return isset($_SESSION['user_id']);
-}
-
-function isAdmin() {
-    return isset($_SESSION['role']) && $_SESSION['role'] === 'admin';
-}
-
-function requireLogin() {
-    if (!isLoggedIn()) {
-        header('Location: login.php');
-        exit;
-    }
-}
-
-function login($username, $password) {
-    $db = Database::getInstance()->getConnection();
-    $stmt = $db->prepare("SELECT id, password, role FROM users WHERE username = ?");
-    $stmt->bind_param('s', $username);
-    $stmt->execute();
-    $result = $stmt->get_result();
-    if ($row = $result->fetch_assoc()) {
-        if (password_verify($password, $row['password'])) {
-            $_SESSION['user_id'] = $row['id'];
-            $_SESSION['username'] = $username;
-            $_SESSION['role'] = $row['role'];
-            return true;
-        }
-    }
-    return false;
-}
-
-function logout() {
-    session_destroy();
-}
-EOF
-
-# --- Write streams functions ---
-cat > $WEB_ROOT/src/stream.php <<'EOF'
-<?php
-require_once 'db.php';
-
-function getStreams() {
-    $db = Database::getInstance()->getConnection();
-    $result = $db->query("SELECT streams.*, users.username AS created_by_name FROM streams JOIN users ON streams.created_by = users.id ORDER BY streams.id DESC");
-    return $result->fetch_all(MYSQLI_ASSOC);
-}
-
-function addStream($name, $url, $user_id) {
-    $db = Database::getInstance()->getConnection();
-    $stmt = $db->prepare("INSERT INTO streams (name, stream_url, created_by) VALUES (?, ?, ?)");
-    $stmt->bind_param("ssi", $name, $url, $user_id);
-    return $stmt->execute();
-}
-
-function getStreamById($id) {
-    $db = Database::getInstance()->getConnection();
-    $stmt = $db->prepare("SELECT * FROM streams WHERE id = ?");
-    $stmt->bind_param('i', $id);
-    $stmt->execute();
-    return $stmt->get_result()->fetch_assoc();
-}
-
-function deleteStream($id) {
-    $db = Database::getInstance()->getConnection();
-    $stmt = $db->prepare("DELETE FROM streams WHERE id = ?");
-    $stmt->bind_param('i', $id);
-    return $stmt->execute();
-}
-EOF
-
-# --- Write M3U parser ---
-cat > $WEB_ROOT/src/m3u_parser.php <<'EOF'
-<?php
-function parseM3U($content) {
-    $lines = explode("\n", $content);
-    $streams = [];
-    $name = '';
-    foreach ($lines as $line) {
-        $line = trim($line);
-        if (strpos($line, '#EXTINF') === 0) {
-            $pos = strpos($line, ',');
-            $name = $pos !== false ? substr($line, $pos + 1) : '';
-        } elseif ($line && substr($line, 0, 1) !== '#') {
-            $streams[] = ['name' => $name, 'url' => $line];
-            $name = '';
-        }
-    }
-    return $streams;
-}
-EOF
-
-# --- Write login.php ---
-cat > $WEB_ROOT/public/login.php <<'EOF'
-<?php
-require_once '../src/auth.php';
-
-if (isLoggedIn()) {
-    header('Location: dashboard.php');
-    exit;
-}
-
-$error = '';
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $username = $_POST['username'] ?? '';
-    $password = $_POST['password'] ?? '';
-    if (login($username, $password)) {
-        header('Location: dashboard.php');
-        exit;
-    } else {
-        $error = 'Invalid username or password.';
-    }
-}
-?>
+# index.html (login page)
+sudo tee $APPDIR/index.html > /dev/null <<'EOF'
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Login - IPTV Panel</title>
-    <link href="css/bootstrap.min.css" rel="stylesheet">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cloud TV Admin Login</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background-color: #121212;
+      color: #ffffff;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+    }
+    .login-container {
+      background-color: #1f1f1f;
+      padding: 30px;
+      border-radius: 8px;
+      box-shadow: 0 0 15px rgba(0, 0, 0, 0.5);
+      width: 300px;
+      text-align: center;
+    }
+    .login-container h2 {
+      margin-bottom: 20px;
+    }
+    .login-container input[type="text"],
+    .login-container input[type="password"] {
+      width: 100%;
+      padding: 10px;
+      margin: 10px 0;
+      border: none;
+      border-radius: 4px;
+    }
+    .login-container button {
+      width: 100%;
+      padding: 10px;
+      background-color: #2196f3;
+      border: none;
+      border-radius: 4px;
+      color: white;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    .login-container button:hover {
+      background-color: #1976d2;
+    }
+    .error {
+      color: #f44336;
+      margin-top: 10px;
+    }
+  </style>
 </head>
 <body>
-<div class="container mt-5" style="max-width: 400px;">
-    <h2>Login</h2>
-    <?php if ($error): ?>
-        <div class="alert alert-danger"><?=htmlspecialchars($error)?></div>
-    <?php endif; ?>
-    <form method="post">
-        <div class="mb-3">
-            <label>Username</label>
-            <input name="username" class="form-control" required>
-        </div>
-        <div class="mb-3">
-            <label>Password</label>
-            <input name="password" type="password" class="form-control" required>
-        </div>
-        <button class="btn btn-primary" type="submit">Login</button>
+  <div class="login-container">
+    <h2>Cloud TV Admin Panel</h2>
+    <form method="POST" action="login.php">
+      <input type="text" name="username" placeholder="Username" required />
+      <input type="password" name="password" placeholder="Password" required />
+      <button type="submit">Login</button>
     </form>
-</div>
+    <?php if (isset($_GET['error'])) echo "<p class='error'>Invalid credentials.</p>"; ?>
+  </div>
 </body>
 </html>
 EOF
 
-# --- Write logout.php ---
-cat > $WEB_ROOT/public/logout.php <<'EOF'
+# login.php
+sudo tee $APPDIR/login.php > /dev/null <<'EOF'
 <?php
-require_once '../src/auth.php';
-logout();
-header('Location: login.php');
-exit;
+session_start();
+
+$host = 'localhost';
+$db   = 'cloudtv';
+$user = 'root';
+$pass = 'CloudTVpass123';
+
+try {
+    $pdo = new PDO("mysql:host=$host;dbname=$db", $user, $pass);
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+} catch (PDOException $e) {
+    die("Database connection failed: " . $e->getMessage());
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $username = $_POST['username'];
+    $password = $_POST['password'];
+
+    $stmt = $pdo->prepare("SELECT * FROM admins WHERE username = ? LIMIT 1");
+    $stmt->execute([$username]);
+    $admin = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if ($admin && password_verify($password, $admin['password'])) {
+        $_SESSION['admin_logged_in'] = true;
+        $_SESSION['admin_user'] = $admin['username'];
+        header("Location: dashboard.php");
+        exit();
+    } else {
+        header("Location: index.html?error=1");
+        exit();
+    }
+}
+?>
 EOF
 
-# --- Write dashboard.php ---
-cat > $WEB_ROOT/public/dashboard.php <<'EOF'
+# dashboard.php
+sudo tee $APPDIR/dashboard.php > /dev/null <<'EOF'
 <?php
-require_once '../src/auth.php';
-require_once '../src/stream.php';
-requireLogin();
+session_start();
+if (!isset($_SESSION['admin_logged_in'])) {
+    header("Location: index.html");
+    exit();
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cloud TV Dashboard</title>
+  <style>
+    body {
+      background-color: #121212;
+      color: #fff;
+      font-family: Arial, sans-serif;
+      margin: 0;
+    }
+    header {
+      background-color: #1f1f1f;
+      padding: 20px;
+      text-align: center;
+      font-size: 24px;
+      font-weight: bold;
+      border-bottom: 1px solid #333;
+    }
+    nav {
+      background-color: #1a1a1a;
+      padding: 15px;
+    }
+    nav a {
+      color: #bbb;
+      margin-right: 15px;
+      text-decoration: none;
+    }
+    nav a:hover {
+      color: #fff;
+    }
+    .content {
+      padding: 20px;
+    }
+  </style>
+</head>
+<body>
+  <header>Cloud TV Admin Dashboard</header>
+  <nav>
+    <a href="dashboard.php">Dashboard</a>
+    <a href="users.php">Users</a>
+    <a href="streams.php">Streams</a>
+    <a href="vod.php">VOD</a>
+    <a href="series.php">Series</a>
+    <a href="logout.php">Logout</a>
+  </nav>
+  <div class="content">
+    <h2>Welcome, <?php echo htmlspecialchars($_SESSION['admin_user']); ?>!</h2>
+    <p>This is the Cloud TV backend dashboard.</p>
+  </div>
+</body>
+</html>
+EOF
 
-$streams = getStreams();
+# logout.php
+sudo tee $APPDIR/logout.php > /dev/null <<'EOF'
+<?php
+session_start();
+session_destroy();
+header("Location: index.html");
+exit();
+?>
+EOF
+
+# users.php
+sudo tee $APPDIR/users.php > /dev/null <<'EOF'
+<?php
+session_start();
+if (!isset($_SESSION['admin_logged_in'])) {
+    header("Location: index.html");
+    exit();
+}
+
+$pdo = new PDO("mysql:host=localhost;dbname=cloudtv", 'root', 'CloudTVpass123');
+$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $name = $_POST['name'];
+    $username = $_POST['username'];
+    $password = password_hash($_POST['password'], PASSWORD_DEFAULT);
+    $plan = $_POST['plan'];
+    $max_connections = (int)$_POST['max_connections'];
+
+    $stmt = $pdo->prepare("INSERT INTO users (name, username, password, plan, max_connections) VALUES (?, ?, ?, ?, ?)");
+    $stmt->execute([$name, $username, $password, $plan, $max_connections]);
+    header("Location: users.php");
+    exit();
+}
+
+$users = $pdo->query("SELECT * FROM users ORDER BY created_at DESC")->fetchAll(PDO::FETCH_ASSOC);
 ?>
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Dashboard - IPTV Panel</title>
-    <link href="css/bootstrap.min.css" rel="stylesheet">
+    <title>Cloud TV - Users</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+    <style>
+        body { background-color: #121212; color: #fff; }
+        .container { margin-top: 50px; }
+        .table-dark td, .table-dark th { color: #fff; }
+        .form-control, .btn { border-radius: 0; }
+    </style>
 </head>
 <body>
-<div class="container mt-4">
-    <h2>Dashboard</h2>
-    <p>Welcome, <?=htmlspecialchars($_SESSION['username'])?> | <a href="logout.php">Logout</a></p>
-    <a href="add_stream.php" class="btn btn-success mb-3">Add Stream</a>
-    <a href="m3u_upload.php" class="btn btn-info mb-3">Import M3U</a>
-    <table class="table table-bordered">
-        <thead>
-            <tr><th>ID</th><th>Name</th><th>URL</th><th>Created By</th><th>Actions</th></tr>
-        </thead>
-        <tbody>
-            <?php foreach ($streams as $stream): ?>
-            <tr>
-                <td><?= $stream['id'] ?></td>
-                <td><?= htmlspecialchars($stream['name']) ?></td>
-                <td><a href="<?= htmlspecialchars($stream['stream_url']) ?>" target="_blank">Link</a></td>
-                <td><?= htmlspecialchars($stream['created_by_name']) ?></td>
-                <td>
-                    <a href="player.php?id=<?= $stream['id'] ?>" class="btn btn-primary btn-sm">Play</a>
-                    <?php if (isAdmin()): ?>
-                    <a href="delete_stream.php?id=<?= $stream['id'] ?>" class="btn btn-danger btn-sm" onclick="return confirm('Delete this stream?')">Delete</a>
-                    <?php endif; ?>
-                </td>
-            </tr>
-            <?php endforeach; ?>
-            <?php if (empty($streams)): ?>
-            <tr><td colspan="5">No streams found.</td></tr>
-            <?php endif; ?>
-        </tbody>
+    <div class="container">
+        <h2>Users</h2>
+        <form method="POST" class="row g-3 mb-4">
+            <div class="col-md-3">
+                <input type="text" name="name" placeholder="Name" class="form-control" required>
+            </div>
+            <div class="col-md-2">
+                <input type="text" name="username" placeholder="Username" class="form-control" required>
+            </div>
+            <div class="col-md-2">
+                <input type="text" name="password" placeholder="Password" class="form-control" required>
+            </div>
+            <div class="col-md-2">
+                <input type="text" name="plan" placeholder="Plan" class="form-control">
+            </div>
+            <div class="col-md-1">
+                <input type="number" name="max_connections" placeholder="Max" class="form-control" min="1">
+            </div>
+            <div class="col-md-2">
+                <button type="submit" class="btn btn-primary w-100">Add User</button>
+            </div>
+        </form>
+
+        <table class="table table-dark table-striped">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Name</th>
+                    <th>Username</th>
+                    <th>Plan</th>
+                    <th>Max</th>
+                    <th>Created</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($users as $user): ?>
+                    <tr>
+                        <td><?= $user['id'] ?></td>
+                        <td><?= htmlspecialchars($user['name']) ?></td>
+                        <td><?= htmlspecialchars($user['username']) ?></td>
+                        <td><?= htmlspecialchars($user['plan']) ?></td>
+                        <td><?= $user['max_connections'] ?></td>
+                        <td><?= $user['created_at'] ?></td>
+                    </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>
+EOF
+
+# streams.php
+sudo tee $APPDIR/streams.php > /dev/null <<'EOF'
+<?php
+session_start();
+if (!isset($_SESSION['admin_logged_in'])) {
+    header("Location: index.html");
+    exit();
+}
+
+$host = 'localhost';
+$db = 'cloudtv';
+$user = 'root';
+$pass = 'CloudTVpass123';
+$pdo = new PDO("mysql:host=$host;dbname=$db", $user, $pass);
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $name = $_POST['name'];
+    $url = $_POST['url'];
+    $category = $_POST['category'];
+    $stmt = $pdo->prepare("INSERT INTO streams (name, url, category) VALUES (?, ?, ?)");
+    $stmt->execute([$name, $url, $category]);
+    header("Location: streams.php");
+    exit();
+}
+
+$streams = $pdo->query("SELECT * FROM streams ORDER BY id DESC")->fetchAll(PDO::FETCH_ASSOC);
+?>
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Cloud TV - Streams</title>
+    <style>
+        body { background: #111; color: #fff; font-family: Arial; }
+        .container { width: 80%; margin: auto; padding-top: 50px; }
+        table { width: 100%; border-collapse: collapse; background: #222; }
+        th, td { padding: 10px; border: 1px solid #444; }
+        th { background: #333; }
+        input, select { padding: 8px; width: 100%; background: #222; color: #fff; border: 1px solid #555; }
+        form { margin-bottom: 20px; }
+        button { background: #2196f3; border: none; padding: 10px 15px; color: white; cursor: pointer; }
+        button:hover { background: #1976d2; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h2>Live Streams</h2>
+    <form method="POST">
+        <input type="text" name="name" placeholder="Stream Name" required>
+        <input type="text" name="url" placeholder="Stream URL" required>
+        <input type="text" name="category" placeholder="Category">
+        <button type="submit">Add Stream</button>
+    </form>
+
+    <table>
+        <tr>
+            <th>ID</th><th>Name</th><th>URL</th><th>Category</th><th>Status</th>
+        </tr>
+        <?php foreach ($streams as $stream): ?>
+        <tr>
+            <td><?= $stream['id'] ?></td>
+            <td><?= htmlspecialchars($stream['name']) ?></td>
+            <td><?= htmlspecialchars($stream['url']) ?></td>
+            <td><?= htmlspecialchars($stream['category']) ?></td>
+            <td><?= $stream['status'] ?></td>
+        </tr>
+        <?php endforeach; ?>
     </table>
 </div>
 </body>
 </html>
 EOF
 
-# --- Write add_stream.php ---
-cat > $WEB_ROOT/public/add_stream.php <<'EOF'
+# vod.php
+sudo tee $APPDIR/vod.php > /dev/null <<'EOF'
 <?php
-require_once '../src/auth.php';
-require_once '../src/stream.php';
-requireLogin();
-if (!isAdmin()) {
-    die("Access denied");
+session_start();
+if (!isset($_SESSION['admin_logged_in'])) {
+    header("Location: index.html");
+    exit();
 }
 
-$error = '';
+$host = 'localhost';
+$db = 'cloudtv';
+$user = 'root';
+$pass = 'CloudTVpass123';
+$pdo = new PDO("mysql:host=$host;dbname=$db", $user, $pass);
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $name = trim($_POST['name'] ?? '');
-    $url = trim($_POST['url'] ?? '');
-    if ($name && $url) {
-        if (addStream($name, $url, $_SESSION['user_id'])) {
-            header('Location: dashboard.php');
-            exit;
-        } else {
-            $error = 'Failed to add stream.';
-        }
-    } else {
-        $error = 'Name and URL are required.';
-    }
+    $title = $_POST['title'];
+    $url = $_POST['url'];
+    $description = $_POST['description'] ?? '';
+    $cover_image = $_POST['cover_image'] ?? '';
+    $stmt = $pdo->prepare("INSERT INTO vod (title, description, url, cover_image) VALUES (?, ?, ?, ?)");
+    $stmt->execute([$title, $description, $url, $cover_image]);
+    header("Location: vod.php");
+    exit();
 }
+
+$vodList = $pdo->query("SELECT * FROM vod ORDER BY id DESC")->fetchAll(PDO::FETCH_ASSOC);
 ?>
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Add Stream - IPTV Panel</title>
-    <link href="css/bootstrap.min.css" rel="stylesheet">
-</head>
-<body>
-<div class="container mt-4" style="max-width:600px;">
-    <h3>Add Stream</h3>
-    <?php if ($error): ?>
-        <div class="alert alert-danger"><?=htmlspecialchars($error)?></div>
-    <?php endif; ?>
-    <form method="post">
-        <div class="mb-3">
-            <label>Stream Name</label>
-            <input name="name" class="form-control" required>
-        </div>
-        <div class="mb-3">
-            <label>Stream URL</label>
-            <input name="url" class="form-control" required>
-        </div>
-        <button class="btn btn-primary" type="submit">Add</button>
-        <a href="dashboard.php" class="btn btn-secondary">Back</a>
-    </form>
-</div>
-</body>
-</html>
-EOF
-
-# --- Write delete_stream.php ---
-cat > $WEB_ROOT/public/delete_stream.php <<'EOF'
-<?php
-require_once '../src/auth.php';
-require_once '../src/stream.php';
-requireLogin();
-if (!isAdmin()) {
-    die("Access denied");
-}
-$id = $_GET['id'] ?? null;
-if (!$id) {
-    die("Stream ID missing");
-}
-deleteStream($id);
-header('Location: dashboard.php');
-exit();
-EOF
-
-# --- Write m3u_upload.php ---
-cat > $WEB_ROOT/public/m3u_upload.php <<'EOF'
-<?php
-require_once '../src/auth.php';
-require_once '../src/m3u_parser.php';
-require_once '../src/stream.php';
-requireLogin();
-if (!isAdmin()) {
-    die("Access denied");
-}
-
-$message = '';
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (isset($_FILES['m3u_file']) && $_FILES['m3u_file']['error'] === UPLOAD_ERR_OK) {
-        $content = file_get_contents($_FILES['m3u_file']['tmp_name']);
-        $streams = parseM3U($content);
-        $added = 0;
-        foreach ($streams as $s) {
-            if (addStream($s['name'], $s['url'], $_SESSION['user_id'])) {
-                $added++;
-            }
-        }
-        $message = "Imported $added streams from M3U.";
-    } else {
-        $message = "Failed to upload M3U file.";
-    }
-}
-?>
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Import M3U Playlist - IPTV Panel</title>
-    <link href="css/bootstrap.min.css" rel="stylesheet">
-</head>
-<body>
-<div class="container mt-4" style="max-width:600px;">
-    <h3>Import M3U Playlist</h3>
-    <?php if ($message): ?>
-        <div class="alert alert-info"><?= htmlspecialchars($message) ?></div>
-    <?php endif; ?>
-    <form method="POST" enctype="multipart/form-data">
-        <div class="mb-3">
-            <label>Select M3U File</label>
-            <input type="file" name="m3u_file" class="form-control" accept=".m3u,.txt" required>
-        </div>
-        <button type="submit" class="btn btn-primary">Import</button>
-        <a href="dashboard.php" class="btn btn-secondary">Back</a>
-    </form>
-</div>
-</body>
-</html>
-EOF
-
-# --- Write player.php ---
-cat > $WEB_ROOT/public/player.php <<'EOF'
-<?php
-require_once '../src/auth.php';
-require_once '../src/stream.php';
-requireLogin();
-
-$stream_id = $_GET['id'] ?? null;
-if (!$stream_id) {
-    die("Stream ID required.");
-}
-
-$stream = getStreamById($stream_id);
-if (!$stream) {
-    die("Stream not found.");
-}
-?>
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Watch Stream - <?= htmlspecialchars($stream['name']) ?></title>
-    <link href="https://vjs.zencdn.net/7.20.3/video-js.css" rel="stylesheet" />
+    <title>Cloud TV - VOD</title>
     <style>
-      .video-js { width: 100%; height: 500px; }
+        body { background: #111; color: #fff; font-family: Arial; }
+        .container { width: 80%; margin: auto; padding-top: 50px; }
+        table { width: 100%; border-collapse: collapse; background: #222; }
+        th, td { padding: 10px; border: 1px solid #444; }
+        th { background: #333; }
+        input { padding: 8px; width: 100%; background: #222; color: #fff; border: 1px solid #555; margin-bottom: 10px;}
+        form { margin-bottom: 20px; }
+        button { background: #2196f3; border: none; padding: 10px 15px; color: white; cursor: pointer; }
+        button:hover { background: #1976d2; }
     </style>
 </head>
 <body>
-<div class="container mt-4" style="max-width:800px;">
-    <h3>Watching: <?= htmlspecialchars($stream['name']) ?></h3>
-    <video
-      id="my-video"
-      class="video-js"
-      controls
-      preload="auto"
-      data-setup="{}"
-      >
-      <source src="<?= htmlspecialchars($stream['stream_url']) ?>" type="application/x-mpegURL" />
-      Your browser does not support the video tag.
-    </video>
-    <p><a href="dashboard.php">Back to Dashboard</a></p>
+<div class="container">
+    <h2>Video On Demand (Movies)</h2>
+    <form method="POST">
+        <input type="text" name="title" placeholder="Movie Title" required>
+        <input type="text" name="description" placeholder="Description">
+        <input type="text" name="url" placeholder="Video URL" required>
+        <input type="text" name="cover_image" placeholder="Cover Image URL">
+        <button type="submit">Add Movie</button>
+    </form>
+
+    <table>
+        <tr>
+            <th>ID</th><th>Title</th><th>Description</th><th>URL</th><th>Cover</th>
+        </tr>
+        <?php foreach ($vodList as $vod): ?>
+        <tr>
+            <td><?= $vod['id'] ?></td>
+            <td><?= htmlspecialchars($vod['title']) ?></td>
+            <td><?= htmlspecialchars($vod['description']) ?></td>
+            <td><?= htmlspecialchars($vod['url']) ?></td>
+            <td><?= htmlspecialchars($vod['cover_image']) ?></td>
+        </tr>
+        <?php endforeach; ?>
+    </table>
 </div>
-<script src="https://vjs.zencdn.net/7.20.3/video.min.js"></script>
 </body>
 </html>
 EOF
 
-# --- Download Bootstrap CSS ---
-echo "[8/10] Downloading Bootstrap CSS..."
-mkdir -p $WEB_ROOT/public/css
-curl -sSL https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css -o $WEB_ROOT/public/css/bootstrap.min.css
+# series.php
+sudo tee $APPDIR/series.php > /dev/null <<'EOF'
+<?php
+session_start();
+if (!isset($_SESSION['admin_logged_in'])) {
+    header("Location: index.html");
+    exit();
+}
 
-# --- Set ownership and permissions ---
-echo "[9/10] Setting permissions..."
-chown -R www-data:www-data $WEB_ROOT
-find $WEB_ROOT -type d -exec chmod 755 {} \;
-find $WEB_ROOT -type f -exec chmod 644 {} \;
+$host = 'localhost';
+$db = 'cloudtv';
+$user = 'root';
+$pass = 'CloudTVpass123';
+$pdo = new PDO("mysql:host=$host;dbname=$db", $user, $pass);
 
-# --- Enable site and restart Apache ---
-echo "[10/10] Configuring Apache site..."
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $series = $_POST['series'];
+    $episode = $_POST['episode'];
+    $url = $_POST['url'];
+    $stmt = $pdo->prepare("INSERT INTO series (series, episode, url) VALUES (?, ?, ?)");
+    $stmt->execute([$series, $episode, $url]);
+    header("Location: series.php");
+    exit();
+}
 
-cat > /etc/apache2/sites-available/iptv-panel.conf <<EOF
-<VirtualHost *:80>
-    ServerAdmin webmaster@localhost
-    DocumentRoot $WEB_ROOT/public
-    <Directory $WEB_ROOT/public>
-        Options Indexes FollowSymLinks
-        AllowOverride All
-        Require all granted
-    </Directory>
-    ErrorLog \${APACHE_LOG_DIR}/iptv-panel_error.log
-    CustomLog \${APACHE_LOG_DIR}/iptv-panel_access.log combined
-</VirtualHost>
+$seriesList = $pdo->query("SELECT * FROM series ORDER BY id DESC")->fetchAll(PDO::FETCH_ASSOC);
+?>
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Cloud TV - Series</title>
+    <style>
+        body { background: #111; color: #fff; font-family: Arial; }
+        .container { width: 80%; margin: auto; padding-top: 50px; }
+        table { width: 100%; border-collapse: collapse; background: #222; }
+        th, td { padding: 10px; border: 1px solid #444; }
+        th { background: #333; }
+        input { padding: 8px; width: 100%; background: #222; color: #fff; border: 1px solid #555; margin-bottom: 10px;}
+        form { margin-bottom: 20px; }
+        button { background: #2196f3; border: none; padding: 10px 15px; color: white; cursor: pointer; }
+        button:hover { background: #1976d2; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h2>TV Series (Episodes)</h2>
+    <form method="POST">
+        <input type="text" name="series" placeholder="Series Title" required>
+        <input type="text" name="episode" placeholder="Episode Title" required>
+        <input type="text" name="url" placeholder="Video URL" required>
+        <button type="submit">Add Episode</button>
+    </form>
+
+    <table>
+        <tr>
+            <th>ID</th><th>Series</th><th>Episode</th><th>URL</th>
+        </tr>
+        <?php foreach ($seriesList as $row): ?>
+        <tr>
+            <td><?= $row['id'] ?></td>
+            <td><?= htmlspecialchars($row['series']) ?></td>
+            <td><?= htmlspecialchars($row['episode']) ?></td>
+            <td><?= htmlspecialchars($row['url']) ?></td>
+        </tr>
+        <?php endforeach; ?>
+    </table>
+</div>
+</body>
+</html>
 EOF
 
-a2dissite 000-default.conf
-a2ensite iptv-panel.conf
+echo "Setting permissions..."
+sudo chown -R www-data:www-data $APPDIR
+sudo chmod -R 755 $APPDIR
 
-systemctl reload apache2
+echo "Enabling Apache rewrite module and allowing .htaccess overrides..."
+sudo a2enmod rewrite
+sudo sed -i '/<Directory \/var\/www\/>/,/<\/Directory>/ s/AllowOverride None/AllowOverride All/' /etc/apache2/apache2.conf
+
+echo "Restarting Apache..."
+sudo systemctl restart apache2
 
 echo "Installation complete!"
-echo
-echo "You can now open your browser and visit your server IP to see the IPTV panel login page."
-echo "Admin credentials:"
-echo "  Username: $ADMIN_USER"
-echo "  Password: $ADMIN_PASS"
+echo "Open your browser and visit: http://localhost/cloudtv"
+echo "Login with username: admin and password: admin123"
+
